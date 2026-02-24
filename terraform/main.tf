@@ -109,11 +109,11 @@ data "archive_file" "lambda_zip" {
 resource "aws_lambda_function" "example" {
   filename         = data.archive_file.lambda_zip.output_path
   function_name    = "${var.project_name}-${var.environment}-${var.lambda_function_name}"
-  role            = aws_iam_role.lambda_role.arn
-  handler         = "lambda_function.handler"
-  runtime         = "python3.9"
-  timeout         = 30
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256  # Se actualiza automáticamente
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "lambda_function.handler"
+  runtime          = "python3.9"
+  timeout          = 30
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256 # Se actualiza automáticamente
 
   environment {
     variables = {

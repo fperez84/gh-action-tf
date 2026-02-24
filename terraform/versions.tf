@@ -1,6 +1,6 @@
 terraform {
   required_version = ">= 1.6.0"
-  
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -15,7 +15,7 @@ terraform {
       version = "~> 2.4"
     }
   }
-  
+
   # Backend local para GitHub Artifacts
   backend "local" {
     path = "terraform.tfstate"
@@ -24,7 +24,7 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
-  
+
   default_tags {
     tags = {
       Environment = var.environment
