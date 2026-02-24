@@ -23,26 +23,35 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
     
+    # ✅ OUTPUTS: Datos que este job expone al job de apply
+    outputs:
+      plan_source: ${{ steps.plan_source.outputs.source }}
+      plan_hash: ${{ steps.verify_plan.outputs.plan_hash }}
+      zip_hash: ${{ steps.verify_plan.outputs.zip_hash }}
+      using_approved_plan: ${{ steps.plan_source.outputs.using_approved_plan }}
+      cache_hit: ${{ steps.restore_approved.outputs.cache-hit }}
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       
-      # Intentar descargar artefactos del PR
-      - name: Download PR Artifacts
-        uses: actions/download-artifact@v4
+      # Intentar restaurar plan aprobado del PR
+      - name: Restore Approved Plan from PR
+        id: restore_approved
+        uses: actions/cache/restore@v4
         with:
-          pattern: terraform-plan-*
-          path: terraform/
-          merge-multiple: true
-        continue-on-error: true
+          path: |
+            terraform/tfplan
+            terraform/lambda_function.zip
+            plan_metadata.json
+          key: terraform-approved-plan-${{ github.sha }}
       
-      # Descargar estado anterior
-      - name: Download Previous State
-        uses: actions/download-artifact@v4
+      # Restaurar estado anterior
+      - name: Restore Previous State
+        uses: actions/cache/restore@v4
         with:
-          name: terraform-state
-          path: terraform/
-        continue-on-error: true
+          path: terraform/terraform.tfstate
+          key: terraform-state-main
       
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -53,31 +62,105 @@ jobs:
         run: terraform init
         working-directory: ./terraform
       
-      # Si no hay plan del PR, crear uno nuevo
-      - name: Check for Existing Plan
-        id: check_plan
+      # Determinar fuente del plan
+      - name: Determine Plan Source
+        id: plan_source
         run: |
-          if [ -f "terraform/tfplan" ]; then
-            echo "plan_exists=true" >> $GITHUB_OUTPUT
-            echo "✅ Using plan from PR"
+          if [ -f "terraform/tfplan" ] && [ "${{ steps.restore_approved.outputs.cache-hit }}" == "true" ]; then
+            echo "source=approved_pr_plan" >> $GITHUB_OUTPUT
+            echo "using_approved_plan=true" >> $GITHUB_OUTPUT
+            echo "✅ Using APPROVED plan from PR (commit: ${{ github.sha }})"
+            
+            if [ -f "plan_metadata.json" ]; then
+              echo "📋 Plan metadata found:"
+              cat plan_metadata.json
+            fi
           else
-            echo "plan_exists=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No plan from PR, creating new one"
+            echo "source=new_plan" >> $GITHUB_OUTPUT
+            echo "using_approved_plan=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No approved plan found, generating NEW plan"
+            echo "This may differ from what was reviewed in the PR!"
           fi
       
-      - name: Terraform Plan (if needed)
-        if: steps.check_plan.outputs.plan_exists == 'false'
+      # Crear nuevo plan solo si no hay plan aprobado
+      - name: Terraform Plan (if no approved plan)
+        if: steps.plan_source.outputs.source == 'new_plan'
         run: terraform plan -no-color -out=tfplan
         working-directory: ./terraform
       
-      - name: Upload Plan
-        uses: actions/upload-artifact@v4
+      # Crear metadata para planes nuevos
+      - name: Create Metadata for New Plan
+        if: steps.plan_source.outputs.source == 'new_plan'
+        run: |
+          cat > plan_metadata.json << 'EOF'
+          {
+            "commit_sha": "${{ github.sha }}",
+            "pr_number": "N/A",
+            "plan_hash": "TBD",
+            "zip_hash": "TBD",
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "author": "${{ github.actor }}",
+            "title": "Direct push to main",
+            "workflow_run_id": "${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "source": "new_plan_main_branch"
+          }
+          EOF
+          
+          echo "📋 Created metadata for new plan:"
+          cat plan_metadata.json
+      
+      # Verificar integridad del plan
+      - name: Verify Plan Integrity
+        id: verify_plan
+        run: |
+          if [ ! -f "terraform/tfplan" ]; then
+            echo "❌ No plan file found"
+            exit 1
+          fi
+          
+          if [ ! -f "terraform/lambda_function.zip" ]; then
+            echo "❌ Lambda ZIP file missing"
+            exit 1
+          fi
+          
+          CURRENT_PLAN_HASH=$(sha256sum terraform/tfplan | cut -d' ' -f1)
+          CURRENT_ZIP_HASH=$(sha256sum terraform/lambda_function.zip | cut -d' ' -f1)
+          
+          echo "plan_hash=$CURRENT_PLAN_HASH" >> $GITHUB_OUTPUT
+          echo "zip_hash=$CURRENT_ZIP_HASH" >> $GITHUB_OUTPUT
+          
+          # Actualizar metadata con hashes reales
+          if [ -f "plan_metadata.json" ]; then
+            # Actualizar hashes en metadata usando jq si está disponible, sino sed
+            if command -v jq >/dev/null 2>&1; then
+              jq --arg ph "$CURRENT_PLAN_HASH" --arg zh "$CURRENT_ZIP_HASH" \
+                '.plan_hash = $ph | .zip_hash = $zh' plan_metadata.json > plan_metadata_tmp.json
+              mv plan_metadata_tmp.json plan_metadata.json
+            else
+              sed -i "s/\"TBD\"/\"$CURRENT_PLAN_HASH\"/" plan_metadata.json
+            fi
+          fi
+          
+          echo "✅ Plan verification complete"
+          echo "Plan hash: $CURRENT_PLAN_HASH"
+          echo "ZIP hash: $CURRENT_ZIP_HASH"
+          
+          if [ "${{ steps.plan_source.outputs.source }}" == "approved_pr_plan" ]; then
+            echo "🔒 Using APPROVED plan from PR review process"
+          else
+            echo "⚠️ Using NEWLY GENERATED plan (not from PR review)"
+          fi
+      
+      # Cache para apply job
+      - name: Cache Plan for Apply
+        uses: actions/cache/save@v4
         with:
-          name: terraform-plan-main
           path: |
             terraform/tfplan
             terraform/lambda_function.zip
-          retention-days: 1
+            plan_metadata.json
+          key: terraform-plan-for-apply-${{ github.run_id }}
 
   terraform-apply:
     name: 'Apply'
@@ -93,57 +176,167 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       
-      # Descargar estado anterior
-      - name: Download Previous State
-        uses: actions/download-artifact@v4
+      # Mostrar información del plan que se va a aplicar
+      - name: Display Plan Information
+        run: |
+          echo "🚀 TERRAFORM APPLY STARTING"
+          echo "================================"
+          echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
+          echo "Plan Hash: ${{ needs.terraform-plan.outputs.plan_hash }}"
+          echo "ZIP Hash: ${{ needs.terraform-plan.outputs.zip_hash }}"
+          echo "Using Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
+          echo "Cache Hit: ${{ needs.terraform-plan.outputs.cache_hit }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Workflow Run ID: ${{ github.run_id }}"
+          echo "================================"
+          
+          if [ "${{ needs.terraform-plan.outputs.using_approved_plan }}" == "true" ]; then
+            echo "✅ APPLYING APPROVED PLAN FROM PR REVIEW"
+            echo "This plan was reviewed and approved in a Pull Request"
+          else
+            echo "⚠️ APPLYING NEWLY GENERATED PLAN"
+            echo "This plan was NOT reviewed in a PR!"
+            echo "Consider using PR workflow for better governance"
+          fi
+      
+      # Restaurar estado anterior
+      - name: Restore Previous State
+        uses: actions/cache/restore@v4
         with:
-          name: terraform-state
-          path: terraform/
-        continue-on-error: true
+          path: terraform/terraform.tfstate
+          key: terraform-state-main
+      
+      # Restaurar plan del job anterior
+      - name: Restore Plan for Apply
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            terraform/tfplan
+            terraform/lambda_function.zip
+            plan_metadata.json
+          key: terraform-plan-for-apply-${{ github.run_id }}
+          fail-on-cache-miss: true
+      
+      # Verificación final antes de apply
+      - name: Final Verification Before Apply
+        run: |
+          echo "🔍 FINAL VERIFICATION BEFORE APPLY"
+          echo "=================================="
+          
+          if [ ! -f "terraform/tfplan" ]; then
+            echo "❌ Plan file missing - ABORTING"
+            exit 1
+          fi
+          
+          if [ ! -f "terraform/lambda_function.zip" ]; then
+            echo "❌ Lambda ZIP missing - ABORTING"
+            exit 1
+          fi
+          
+          # Verificar hashes
+          CURRENT_PLAN_HASH=$(sha256sum terraform/tfplan | cut -d' ' -f1)
+          CURRENT_ZIP_HASH=$(sha256sum terraform/lambda_function.zip | cut -d' ' -f1)
+          EXPECTED_PLAN_HASH="${{ needs.terraform-plan.outputs.plan_hash }}"
+          EXPECTED_ZIP_HASH="${{ needs.terraform-plan.outputs.zip_hash }}"
+          
+          echo "Plan Hash Verification:"
+          echo "  Expected: $EXPECTED_PLAN_HASH"
+          echo "  Current:  $CURRENT_PLAN_HASH"
+          
+          echo "ZIP Hash Verification:"
+          echo "  Expected: $EXPECTED_ZIP_HASH"
+          echo "  Current:  $CURRENT_ZIP_HASH"
+          
+          if [ "$CURRENT_PLAN_HASH" != "$EXPECTED_PLAN_HASH" ]; then
+            echo "❌ Plan hash mismatch - ABORTING"
+            exit 1
+          fi
+          
+          if [ "$CURRENT_ZIP_HASH" != "$EXPECTED_ZIP_HASH" ]; then
+            echo "❌ ZIP hash mismatch - ABORTING"
+            exit 1
+          fi
+          
+          # Mostrar metadata si existe
+          if [ -f "plan_metadata.json" ]; then
+            echo ""
+            echo "📋 Plan Metadata:"
+            cat plan_metadata.json
+          fi
+          
+          echo ""
+          echo "✅ All files verified - PROCEEDING WITH APPLY"
+          echo "File listing:"
+          ls -la terraform/
       
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
       
-      - name: Download Plan and ZIP
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform-plan-main
-          path: terraform/
-      
-      - name: Verify Artifacts
-        run: |
-          echo "=== Checking downloaded artifacts ==="
-          ls -la terraform/
-          if [ -f "terraform/tfplan" ]; then
-            echo "✅ Plan file exists"
-          else
-            echo "❌ Plan file missing"
-            exit 1
-          fi
-          if [ -f "terraform/lambda_function.zip" ]; then
-            echo "✅ Lambda ZIP exists"
-          else
-            echo "❌ Lambda ZIP missing"
-            exit 1
-          fi
-      
       - name: Terraform Init
         run: terraform init
         working-directory: ./terraform
       
-      - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+      # Mostrar plan antes de aplicar (para logs)
+      - name: Show Plan Before Apply
+        run: |
+          echo "📋 PLAN TO BE APPLIED:"
+          echo "====================="
+          terraform show -no-color tfplan
+          echo "====================="
         working-directory: ./terraform
       
-      # Subir nuevo estado Y el ZIP para próximas ejecuciones
-      - name: Upload New State and Artifacts
+      - name: Terraform Apply
+        run: |
+          echo "🚀 APPLYING TERRAFORM CHANGES"
+          echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
+          echo "Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
+          echo ""
+          terraform apply -auto-approve tfplan
+          echo ""
+          echo "✅ TERRAFORM APPLY COMPLETED SUCCESSFULLY"
+        working-directory: ./terraform
+      
+      # Guardar nuevo estado
+      - name: Save New State
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: terraform-state
-          path: |
-            terraform/terraform.tfstate
-            terraform/lambda_function.zip
-          retention-days: 30
+          path: terraform/terraform.tfstate
+          key: terraform-state-main
+      
+      # Log final del resultado
+      - name: Apply Summary
+        if: always()
+        run: |
+          echo ""
+          echo "📊 APPLY SUMMARY"
+          echo "================"
+          echo "Status: ${{ job.status }}"
+          echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
+          echo "Used Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
+          echo "Plan Hash: ${{ needs.terraform-plan.outputs.plan_hash }}"
+          echo "ZIP Hash: ${{ needs.terraform-plan.outputs.zip_hash }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Workflow: ${{ github.run_id }}"
+          echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "================"
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Infrastructure successfully updated"
+            if [ "${{ needs.terraform-plan.outputs.using_approved_plan }}" == "true" ]; then
+              echo "🔒 Applied plan was reviewed and approved in PR"
+            else
+              echo "⚠️ Applied plan was generated directly in main branch"
+            fi
+          else
+            echo "❌ Apply failed - check logs above"
+            echo "State may be in inconsistent condition"
+          fi
+          
+          echo ""
+          echo "Next steps:"
+          echo "- Check AWS console for deployed resources"
+          echo "- Verify Lambda function is working"
+          echo "- Check CloudWatch logs and metrics"

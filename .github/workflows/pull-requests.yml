@@ -111,26 +111,76 @@ jobs:
         run: terraform plan -no-color -out=tfplan
         working-directory: ./terraform
       
-      # Subir plan y ZIP para que main los use
-      - name: Upload Plan for Main
-        uses: actions/upload-artifact@v4
+      - name: Generate Plan Hash for Verification
+        id: plan_hash
+        run: |
+          PLAN_HASH=$(sha256sum terraform/tfplan | cut -d' ' -f1)
+          ZIP_HASH=$(sha256sum terraform/lambda_function.zip | cut -d' ' -f1)
+          echo "plan_hash=$PLAN_HASH" >> $GITHUB_OUTPUT
+          echo "zip_hash=$ZIP_HASH" >> $GITHUB_OUTPUT
+          echo "Plan hash: $PLAN_HASH"
+          echo "ZIP hash: $ZIP_HASH"
+      
+      - name: Create Plan Metadata
+        run: |
+          cat > plan_metadata.json << 'EOF'
+          {
+            "commit_sha": "${{ github.event.pull_request.head.sha }}",
+            "pr_number": "${{ github.event.pull_request.number }}",
+            "plan_hash": "${{ steps.plan_hash.outputs.plan_hash }}",
+            "zip_hash": "${{ steps.plan_hash.outputs.zip_hash }}",
+            "created_at": "${{ github.event.pull_request.created_at }}",
+            "author": "${{ github.event.pull_request.user.login }}",
+            "title": "${{ github.event.pull_request.title }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          
+          echo "📋 Created plan metadata:"
+          cat plan_metadata.json
+      
+      # Cache del plan aprobado para main
+      - name: Cache Approved Plan for Main
+        uses: actions/cache/save@v4
         with:
-          name: terraform-plan-${{ github.event.pull_request.head.sha }}
           path: |
             terraform/tfplan
             terraform/lambda_function.zip
-          retention-days: 7
+            plan_metadata.json
+          key: terraform-approved-plan-${{ github.event.pull_request.head.sha }}
       
       - name: Comment Plan on PR
         uses: actions/github-script@v7
         with:
           script: |
             const { execSync } = require('child_process');
+            const fs = require('fs');
             
             try {
               const planOutput = execSync('cd terraform && terraform show -no-color tfplan', { encoding: 'utf8' });
               
-              const comment = `## 🏗️ Terraform Plan
+              // Leer metadata si existe
+              let metadataInfo = '';
+              try {
+                const metadata = JSON.parse(fs.readFileSync('plan_metadata.json', 'utf8'));
+                metadataInfo = `
+              **📋 Plan Metadata:**
+              - **Commit SHA:** \`${metadata.commit_sha}\`
+              - **Plan Hash:** \`${metadata.plan_hash}\`
+              - **ZIP Hash:** \`${metadata.zip_hash}\`
+              - **Created:** ${metadata.timestamp}
+              - **Cache Key:** \`terraform-approved-plan-${{ github.event.pull_request.head.sha }}\``;
+              } catch (e) {
+                metadataInfo = `
+              **📋 Plan Details:**
+              - **Commit SHA:** \`${{ github.event.pull_request.head.sha }}\`
+              - **Plan Hash:** \`${{ steps.plan_hash.outputs.plan_hash }}\`
+              - **ZIP Hash:** \`${{ steps.plan_hash.outputs.zip_hash }}\``;
+              }
+              
+              const comment = `## 🏗️ Terraform Plan (Approved for Deployment)
+              ${metadataInfo}
               
               <details>
               <summary>📋 Click to expand plan details</summary>
@@ -141,10 +191,11 @@ jobs:
               
               </details>
               
-              **Plan Status:** ✅ Success
-              **Triggered by:** @${{ github.actor }}
-              **Commit:** ${{ github.sha }}
-              **Artifacts:** Plan and Lambda ZIP uploaded for main deployment`;
+              **✅ This exact plan will be applied when merged to main**
+              
+              **Plan Status:** ✅ Success  
+              **Triggered by:** @${{ github.actor }}  
+              **PR:** #${{ github.event.pull_request.number }}`;
               
               await github.rest.issues.createComment({
                 issue_number: context.issue.number,
