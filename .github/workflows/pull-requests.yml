@@ -171,7 +171,7 @@ jobs:
               - **Commit SHA:** \`${metadata.commit_sha}\`
               - **Plan Hash:** \`${metadata.plan_hash}\`
               - **ZIP Hash:** \`${metadata.zip_hash}\`
-              - **Created:** ${metadata.timestamp}
+              - **Created:** \`${metadata.timestamp}\`
               - **Cache Key:** \`terraform-approved-plan-${{ github.event.pull_request.head.sha }}\``;
               } catch (e) {
                 metadataInfo = `
