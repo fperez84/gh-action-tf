@@ -1,0 +1,149 @@
+name: 'Terraform Deploy'
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: [ "terraform/**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: '1.14.3'
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  TF_IN_AUTOMATION: true
+
+jobs:
+  terraform-plan:
+    name: 'Plan'
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      # Intentar descargar artefactos del PR
+      - name: Download PR Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: terraform-plan-*
+          path: terraform/
+          merge-multiple: true
+        continue-on-error: true
+      
+      # Descargar estado anterior
+      - name: Download Previous State
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-state
+          path: terraform/
+        continue-on-error: true
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+      
+      # Si no hay plan del PR, crear uno nuevo
+      - name: Check for Existing Plan
+        id: check_plan
+        run: |
+          if [ -f "terraform/tfplan" ]; then
+            echo "plan_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Using plan from PR"
+          else
+            echo "plan_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No plan from PR, creating new one"
+          fi
+      
+      - name: Terraform Plan (if needed)
+        if: steps.check_plan.outputs.plan_exists == 'false'
+        run: terraform plan -no-color -out=tfplan
+        working-directory: ./terraform
+      
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-main
+          path: |
+            terraform/tfplan
+            terraform/lambda_function.zip
+          retention-days: 1
+
+  terraform-apply:
+    name: 'Apply'
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    environment: production
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      # Descargar estado anterior
+      - name: Download Previous State
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-state
+          path: terraform/
+        continue-on-error: true
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Download Plan and ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-main
+          path: terraform/
+      
+      - name: Verify Artifacts
+        run: |
+          echo "=== Checking downloaded artifacts ==="
+          ls -la terraform/
+          if [ -f "terraform/tfplan" ]; then
+            echo "✅ Plan file exists"
+          else
+            echo "❌ Plan file missing"
+            exit 1
+          fi
+          if [ -f "terraform/lambda_function.zip" ]; then
+            echo "✅ Lambda ZIP exists"
+          else
+            echo "❌ Lambda ZIP missing"
+            exit 1
+          fi
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+      
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        working-directory: ./terraform
+      
+      # Subir nuevo estado Y el ZIP para próximas ejecuciones
+      - name: Upload New State and Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state
+          path: |
+            terraform/terraform.tfstate
+            terraform/lambda_function.zip
+          retention-days: 30

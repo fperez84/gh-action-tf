@@ -1,0 +1,90 @@
+name: 'Terraform Manual Operations'
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - destroy
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: '1.14.3'
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  TF_IN_AUTOMATION: true
+
+jobs:
+  terraform-manual:
+    name: 'Manual ${{ inputs.action }}'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
+      TF_VAR_environment: ${{ inputs.environment }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download Previous State
+        if: inputs.action != 'plan'
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-state
+          path: terraform/
+        continue-on-error: true
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+      
+      - name: Terraform ${{ inputs.action }}
+        run: |
+          case "${{ inputs.action }}" in
+            plan)
+              terraform plan -no-color
+              ;;
+            apply)
+              terraform plan -no-color -out=tfplan
+              terraform apply -auto-approve tfplan
+              ;;
+            destroy)
+              terraform plan -destroy -no-color -out=tfplan
+              terraform apply -auto-approve tfplan
+              ;;
+          esac
+        working-directory: ./terraform
+      
+      - name: Upload State
+        if: inputs.action != 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state
+          path: |
+            terraform/terraform.tfstate
+            terraform/lambda_function.zip
+          retention-days: 30
