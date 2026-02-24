@@ -125,10 +125,10 @@ jobs:
       
       - name: Create Plan Metadata
         run: |
-          cat > plan_metadata.json << 'EOF'
-          {
+            cat > plan_metadata.json << EOF
+            {
             "commit_sha": "${{ github.event.pull_request.head.sha }}",
-            "pr_number": "${{ github.event.pull_request.number }}",
+            "pr_number": ${{ github.event.pull_request.number }},
             "plan_hash": "${{ steps.plan_hash.outputs.plan_hash }}",
             "zip_hash": "${{ steps.plan_hash.outputs.zip_hash }}",
             "created_at": "${{ github.event.pull_request.created_at }}",
@@ -136,12 +136,12 @@ jobs:
             "title": "${{ github.event.pull_request.title }}",
             "workflow_run_id": "${{ github.run_id }}",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
-          
-          echo "📋 Created plan metadata:"
-          cat plan_metadata.json
-      
+            }
+            EOF
+            
+            echo "📋 Created plan metadata:"
+            cat plan_metadata.json | jq . 2>/dev/null || cat plan_metadata.json
+
       # Cache del plan aprobado para main
       - name: Cache Approved Plan for Main
         uses: actions/cache/save@v4
