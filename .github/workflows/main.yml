@@ -3,9 +3,9 @@ name: 'Terraform Deploy'
 on:
   push:
     branches: [ "main" ]
-    paths:
+    paths: 
       - "terraform/**"
-      - ".github/workflows/terraform-main.yml"
+      - ".github/workflows/main.yml"
   workflow_dispatch:
 
 permissions:
@@ -24,14 +24,15 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
+      TF_VAR_environment: dev
     
-    # ✅ OUTPUTS: Datos que este job expone al job de apply
     outputs:
       plan_source: ${{ steps.plan_source.outputs.source }}
       plan_hash: ${{ steps.verify_plan.outputs.plan_hash }}
       zip_hash: ${{ steps.verify_plan.outputs.zip_hash }}
       using_approved_plan: ${{ steps.plan_source.outputs.using_approved_plan }}
-      cache_hit: ${{ steps.restore_approved.outputs.cache-hit }}
+      cache_key: ${{ steps.plan_source.outputs.cache_key }}
+      environment: dev
     
     steps:
       - name: Checkout
@@ -48,13 +49,6 @@ jobs:
             plan_metadata.json
           key: terraform-approved-plan-${{ github.sha }}
       
-      # Restaurar estado anterior
-      - name: Restore Previous State
-        uses: actions/cache/restore@v4
-        with:
-          path: terraform/terraform.tfstate
-          key: terraform-state-main
-      
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -68,9 +62,12 @@ jobs:
       - name: Determine Plan Source
         id: plan_source
         run: |
+          echo "🏗️ Planning for environment: dev"
+          
           if [ -f "terraform/tfplan" ] && [ "${{ steps.restore_approved.outputs.cache-hit }}" == "true" ]; then
             echo "source=approved_pr_plan" >> $GITHUB_OUTPUT
             echo "using_approved_plan=true" >> $GITHUB_OUTPUT
+            echo "cache_key=terraform-approved-plan-${{ github.sha }}" >> $GITHUB_OUTPUT
             echo "✅ Using APPROVED plan from PR (commit: ${{ github.sha }})"
             
             if [ -f "plan_metadata.json" ]; then
@@ -78,10 +75,17 @@ jobs:
               cat plan_metadata.json
             fi
           else
+            # Generar nuevo plan
             echo "source=new_plan" >> $GITHUB_OUTPUT
             echo "using_approved_plan=false" >> $GITHUB_OUTPUT
+            
+            # Crear cache key único para nuevo plan
+            NEW_CACHE_KEY="terraform-main-plan-${{ github.run_id }}-${{ github.run_attempt }}"
+            echo "cache_key=$NEW_CACHE_KEY" >> $GITHUB_OUTPUT
+            
             echo "⚠️ No approved plan found, generating NEW plan"
             echo "This may differ from what was reviewed in the PR!"
+            echo "New cache key: $NEW_CACHE_KEY"
           fi
       
       # Crear nuevo plan solo si no hay plan aprobado
@@ -94,18 +98,22 @@ jobs:
       - name: Create Metadata for New Plan
         if: steps.plan_source.outputs.source == 'new_plan'
         run: |
-          cat > plan_metadata.json << 'EOF'
+          CURRENT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          cat > plan_metadata.json << EOF
           {
             "commit_sha": "${{ github.sha }}",
             "pr_number": "N/A",
             "plan_hash": "TBD",
             "zip_hash": "TBD",
-            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "created_at": "$CURRENT_TIMESTAMP",
             "author": "${{ github.actor }}",
             "title": "Direct push to main",
             "workflow_run_id": "${{ github.run_id }}",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "source": "new_plan_main_branch"
+            "timestamp": "$CURRENT_TIMESTAMP",
+            "source": "main_branch_direct",
+            "environment": "dev",
+            "cache_key": "${{ steps.plan_source.outputs.cache_key }}"
           }
           EOF
           
@@ -134,7 +142,6 @@ jobs:
           
           # Actualizar metadata con hashes reales
           if [ -f "plan_metadata.json" ]; then
-            # Actualizar hashes en metadata usando jq si está disponible, sino sed
             if command -v jq >/dev/null 2>&1; then
               jq --arg ph "$CURRENT_PLAN_HASH" --arg zh "$CURRENT_ZIP_HASH" \
                 '.plan_hash = $ph | .zip_hash = $zh' plan_metadata.json > plan_metadata_tmp.json
@@ -147,14 +154,10 @@ jobs:
           echo "✅ Plan verification complete"
           echo "Plan hash: $CURRENT_PLAN_HASH"
           echo "ZIP hash: $CURRENT_ZIP_HASH"
-          
-          if [ "${{ steps.plan_source.outputs.source }}" == "approved_pr_plan" ]; then
-            echo "🔒 Using APPROVED plan from PR review process"
-          else
-            echo "⚠️ Using NEWLY GENERATED plan (not from PR review)"
-          fi
+          echo "Environment: dev"
+          echo "Cache key: ${{ steps.plan_source.outputs.cache_key }}"
       
-      # Cache para apply job
+      # Cache para apply job - KEY ÚNICO POR WORKFLOW RUN
       - name: Cache Plan for Apply
         uses: actions/cache/save@v4
         with:
@@ -162,17 +165,18 @@ jobs:
             terraform/tfplan
             terraform/lambda_function.zip
             plan_metadata.json
-          key: terraform-plan-for-apply-${{ github.run_id }}
+          key: terraform-apply-${{ github.run_id }}-${{ github.run_attempt }}
 
   terraform-apply:
     name: 'Apply'
     runs-on: ubuntu-latest
     needs: [terraform-plan]
-    environment: production
+    environment: ${{ needs.terraform-plan.outputs.environment }}
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
+      TF_VAR_environment: ${{ needs.terraform-plan.outputs.environment }}
     
     steps:
       - name: Checkout
@@ -183,11 +187,12 @@ jobs:
         run: |
           echo "🚀 TERRAFORM APPLY STARTING"
           echo "================================"
+          echo "Environment: ${{ needs.terraform-plan.outputs.environment }}"
           echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
           echo "Plan Hash: ${{ needs.terraform-plan.outputs.plan_hash }}"
           echo "ZIP Hash: ${{ needs.terraform-plan.outputs.zip_hash }}"
           echo "Using Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
-          echo "Cache Hit: ${{ needs.terraform-plan.outputs.cache_hit }}"
+          echo "Cache Key: ${{ needs.terraform-plan.outputs.cache_key }}"
           echo "Commit SHA: ${{ github.sha }}"
           echo "Workflow Run ID: ${{ github.run_id }}"
           echo "================================"
@@ -201,13 +206,6 @@ jobs:
             echo "Consider using PR workflow for better governance"
           fi
       
-      # Restaurar estado anterior
-      - name: Restore Previous State
-        uses: actions/cache/restore@v4
-        with:
-          path: terraform/terraform.tfstate
-          key: terraform-state-main
-      
       # Restaurar plan del job anterior
       - name: Restore Plan for Apply
         uses: actions/cache/restore@v4
@@ -216,7 +214,7 @@ jobs:
             terraform/tfplan
             terraform/lambda_function.zip
             plan_metadata.json
-          key: terraform-plan-for-apply-${{ github.run_id }}
+          key: terraform-apply-${{ github.run_id }}-${{ github.run_attempt }}
           fail-on-cache-miss: true
       
       # Verificación final antes de apply
@@ -224,6 +222,7 @@ jobs:
         run: |
           echo "🔍 FINAL VERIFICATION BEFORE APPLY"
           echo "=================================="
+          echo "Target Environment: ${{ needs.terraform-plan.outputs.environment }}"
           
           if [ ! -f "terraform/tfplan" ]; then
             echo "❌ Plan file missing - ABORTING"
@@ -292,6 +291,7 @@ jobs:
       - name: Terraform Apply
         run: |
           echo "🚀 APPLYING TERRAFORM CHANGES"
+          echo "Environment: ${{ needs.terraform-plan.outputs.environment }}"
           echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
           echo "Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
           echo ""
@@ -299,14 +299,6 @@ jobs:
           echo ""
           echo "✅ TERRAFORM APPLY COMPLETED SUCCESSFULLY"
         working-directory: ./terraform
-      
-      # Guardar nuevo estado
-      - name: Save New State
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: terraform/terraform.tfstate
-          key: terraform-state-main
       
       # Log final del resultado
       - name: Apply Summary
@@ -316,10 +308,12 @@ jobs:
           echo "📊 APPLY SUMMARY"
           echo "================"
           echo "Status: ${{ job.status }}"
+          echo "Environment: ${{ needs.terraform-plan.outputs.environment }}"
           echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
           echo "Used Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
           echo "Plan Hash: ${{ needs.terraform-plan.outputs.plan_hash }}"
           echo "ZIP Hash: ${{ needs.terraform-plan.outputs.zip_hash }}"
+          echo "Cache Key: ${{ needs.terraform-plan.outputs.cache_key }}"
           echo "Commit: ${{ github.sha }}"
           echo "Workflow: ${{ github.run_id }}"
           echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -327,6 +321,7 @@ jobs:
           
           if [ "${{ job.status }}" == "success" ]; then
             echo "✅ Infrastructure successfully updated"
+            echo "🗃️ State stored in S3 backend"
             if [ "${{ needs.terraform-plan.outputs.using_approved_plan }}" == "true" ]; then
               echo "🔒 Applied plan was reviewed and approved in PR"
             else
@@ -334,7 +329,8 @@ jobs:
             fi
           else
             echo "❌ Apply failed - check logs above"
-            echo "State may be in inconsistent condition"
+            echo "🗃️ State may be in inconsistent condition"
+            echo "💡 You can re-run this job or use manual workflow"
           fi
           
           echo ""
@@ -342,3 +338,4 @@ jobs:
           echo "- Check AWS console for deployed resources"
           echo "- Verify Lambda function is working"
           echo "- Check CloudWatch logs and metrics"
+          echo "- State is automatically stored in S3"
