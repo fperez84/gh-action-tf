@@ -25,7 +25,6 @@ env:
   TF_VERSION: '1.14.3'
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   TF_IN_AUTOMATION: true
-  ENVIRONMENT: 'dev'
 
 jobs:
   terraform-manual:
@@ -64,6 +63,8 @@ jobs:
             terraform/lambda_function.zip
             plan_metadata.json
           key: terraform-approved-plan-${{ github.sha }}
+          restore-keys: |
+            terraform-approved-plan-
       
       # Si no encuentra plan del PR, buscar plan de main reciente
       - name: Try Restore Recent Main Plan
@@ -112,28 +113,34 @@ jobs:
               terraform plan -no-color -out=tfplan
               
               # Crear metadata para el plan manual
-
               CURRENT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
               PLAN_HASH=$(sha256sum tfplan | cut -d' ' -f1)
               ZIP_HASH=$(sha256sum lambda_function.zip | cut -d' ' -f1)
               CACHE_KEY="terraform-manual-plan-${{ github.run_id }}"
               
-              cat > plan_metadata.json << EOF
-              {
-                "commit_sha": "${{ github.sha }}",
-                "pr_number": "N/A",
-                "plan_hash": "$PLAN_HASH",
-                "zip_hash": "$ZIP_HASH",
-                "created_at": "$CURRENT_TIMESTAMP",
-                "author": "${{ github.actor }}",
-                "title": "Manual plan generation",
-                "workflow_run_id": "${{ github.run_id }}",
-                "timestamp": "$CURRENT_TIMESTAMP",
-                "source": "manual_workflow",
-                "environment": "dev",
-                "cache_key": "$CACHE_KEY"
-              }
-              EOF
+              # Crear metadata usando cat con heredoc
+              cat > plan_metadata.json << 'METADATA_EOF'
+          {
+            "commit_sha": "${{ github.sha }}",
+            "pr_number": "N/A",
+            "plan_hash": "PLAN_HASH_PLACEHOLDER",
+            "zip_hash": "ZIP_HASH_PLACEHOLDER",
+            "created_at": "TIMESTAMP_PLACEHOLDER",
+            "author": "${{ github.actor }}",
+            "title": "Manual plan generation",
+            "workflow_run_id": "${{ github.run_id }}",
+            "timestamp": "TIMESTAMP_PLACEHOLDER",
+            "source": "manual_workflow",
+            "environment": "dev",
+            "cache_key": "CACHE_KEY_PLACEHOLDER"
+          }
+          METADATA_EOF
+              
+              # Reemplazar placeholders
+              sed -i "s/PLAN_HASH_PLACEHOLDER/$PLAN_HASH/g" plan_metadata.json
+              sed -i "s/ZIP_HASH_PLACEHOLDER/$ZIP_HASH/g" plan_metadata.json
+              sed -i "s/TIMESTAMP_PLACEHOLDER/$CURRENT_TIMESTAMP/g" plan_metadata.json
+              sed -i "s/CACHE_KEY_PLACEHOLDER/$CACHE_KEY/g" plan_metadata.json
               
               echo "📋 Plan generated with metadata:"
               cat plan_metadata.json

@@ -33,12 +33,13 @@ jobs:
       using_approved_plan: ${{ steps.plan_source.outputs.using_approved_plan }}
       cache_key: ${{ steps.plan_source.outputs.cache_key }}
       environment: dev
+      matched_cache_key: ${{ steps.restore_approved.outputs.cache-matched-key }}
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       
-      # Intentar restaurar plan aprobado del PR
+      # Intentar restaurar plan aprobado del PR con restore-keys
       - name: Restore Approved Plan from PR
         id: restore_approved
         uses: actions/cache/restore@v4
@@ -48,6 +49,8 @@ jobs:
             terraform/lambda_function.zip
             plan_metadata.json
           key: terraform-approved-plan-${{ github.sha }}
+          restore-keys: |
+            terraform-approved-plan-
       
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -58,21 +61,49 @@ jobs:
         run: terraform init
         working-directory: ./terraform
       
-      # Determinar fuente del plan
+      # Determinar fuente del plan con mejor lógica
       - name: Determine Plan Source
         id: plan_source
         run: |
           echo "🏗️ Planning for environment: dev"
+          echo "Cache hit: ${{ steps.restore_approved.outputs.cache-hit }}"
+          echo "Cache matched key: ${{ steps.restore_approved.outputs.cache-matched-key }}"
           
-          if [ -f "terraform/tfplan" ] && [ "${{ steps.restore_approved.outputs.cache-hit }}" == "true" ]; then
-            echo "source=approved_pr_plan" >> $GITHUB_OUTPUT
-            echo "using_approved_plan=true" >> $GITHUB_OUTPUT
-            echo "cache_key=terraform-approved-plan-${{ github.sha }}" >> $GITHUB_OUTPUT
-            echo "✅ Using APPROVED plan from PR (commit: ${{ github.sha }})"
+          if [ -f "terraform/tfplan" ]; then
+            if [ "${{ steps.restore_approved.outputs.cache-hit }}" == "true" ]; then
+              echo "source=approved_pr_plan" >> $GITHUB_OUTPUT
+              echo "using_approved_plan=true" >> $GITHUB_OUTPUT
+              echo "cache_key=terraform-approved-plan-${{ github.sha }}" >> $GITHUB_OUTPUT
+              echo "✅ Using APPROVED plan from PR (exact match)"
+            elif [ "${{ steps.restore_approved.outputs.cache-matched-key }}" != "" ]; then
+              echo "source=approved_pr_plan" >> $GITHUB_OUTPUT
+              echo "using_approved_plan=true" >> $GITHUB_OUTPUT
+              echo "cache_key=${{ steps.restore_approved.outputs.cache-matched-key }}" >> $GITHUB_OUTPUT
+              echo "✅ Using APPROVED plan from PR (found via restore-keys)"
+              echo "Matched cache key: ${{ steps.restore_approved.outputs.cache-matched-key }}"
+            else
+              echo "source=approved_pr_plan" >> $GITHUB_OUTPUT
+              echo "using_approved_plan=true" >> $GITHUB_OUTPUT
+              echo "cache_key=unknown" >> $GITHUB_OUTPUT
+              echo "✅ Using APPROVED plan from PR (file found)"
+            fi
             
             if [ -f "plan_metadata.json" ]; then
+              echo ""
               echo "📋 Plan metadata found:"
               cat plan_metadata.json
+              
+              # Extraer información del plan original
+              if command -v jq >/dev/null 2>&1; then
+                ORIGINAL_COMMIT=$(jq -r '.commit_sha // "unknown"' plan_metadata.json)
+                ORIGINAL_PR=$(jq -r '.pr_number // "unknown"' plan_metadata.json)
+                ORIGINAL_AUTHOR=$(jq -r '.author // "unknown"' plan_metadata.json)
+                echo ""
+                echo "📊 Original plan info:"
+                echo "  Commit: $ORIGINAL_COMMIT"
+                echo "  PR: $ORIGINAL_PR"
+                echo "  Author: $ORIGINAL_AUTHOR"
+              fi
             fi
           else
             # Generar nuevo plan
@@ -140,8 +171,8 @@ jobs:
           echo "plan_hash=$CURRENT_PLAN_HASH" >> $GITHUB_OUTPUT
           echo "zip_hash=$CURRENT_ZIP_HASH" >> $GITHUB_OUTPUT
           
-          # Actualizar metadata con hashes reales
-          if [ -f "plan_metadata.json" ]; then
+          # Actualizar metadata con hashes reales si es plan nuevo
+          if [ "${{ steps.plan_source.outputs.source }}" == "new_plan" ] && [ -f "plan_metadata.json" ]; then
             if command -v jq >/dev/null 2>&1; then
               jq --arg ph "$CURRENT_PLAN_HASH" --arg zh "$CURRENT_ZIP_HASH" \
                 '.plan_hash = $ph | .zip_hash = $zh' plan_metadata.json > plan_metadata_tmp.json
@@ -171,12 +202,12 @@ jobs:
     name: 'Apply'
     runs-on: ubuntu-latest
     needs: [terraform-plan]
-    environment: ${{ needs.terraform-plan.outputs.environment }}
+    environment: dev
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
-      TF_VAR_environment: ${{ needs.terraform-plan.outputs.environment }}
+      TF_VAR_environment: dev
     
     steps:
       - name: Checkout
@@ -187,12 +218,13 @@ jobs:
         run: |
           echo "🚀 TERRAFORM APPLY STARTING"
           echo "================================"
-          echo "Environment: ${{ needs.terraform-plan.outputs.environment }}"
+          echo "Environment: dev"
           echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
           echo "Plan Hash: ${{ needs.terraform-plan.outputs.plan_hash }}"
           echo "ZIP Hash: ${{ needs.terraform-plan.outputs.zip_hash }}"
           echo "Using Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
           echo "Cache Key: ${{ needs.terraform-plan.outputs.cache_key }}"
+          echo "Matched Cache Key: ${{ needs.terraform-plan.outputs.matched_cache_key }}"
           echo "Commit SHA: ${{ github.sha }}"
           echo "Workflow Run ID: ${{ github.run_id }}"
           echo "================================"
@@ -222,7 +254,7 @@ jobs:
         run: |
           echo "🔍 FINAL VERIFICATION BEFORE APPLY"
           echo "=================================="
-          echo "Target Environment: ${{ needs.terraform-plan.outputs.environment }}"
+          echo "Target Environment: dev"
           
           if [ ! -f "terraform/tfplan" ]; then
             echo "❌ Plan file missing - ABORTING"
@@ -291,7 +323,7 @@ jobs:
       - name: Terraform Apply
         run: |
           echo "🚀 APPLYING TERRAFORM CHANGES"
-          echo "Environment: ${{ needs.terraform-plan.outputs.environment }}"
+          echo "Environment: dev"
           echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
           echo "Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
           echo ""
@@ -301,6 +333,7 @@ jobs:
         working-directory: ./terraform
       
       # Log final del resultado
+
       - name: Apply Summary
         if: always()
         run: |
@@ -308,12 +341,13 @@ jobs:
           echo "📊 APPLY SUMMARY"
           echo "================"
           echo "Status: ${{ job.status }}"
-          echo "Environment: ${{ needs.terraform-plan.outputs.environment }}"
+          echo "Environment: dev"
           echo "Plan Source: ${{ needs.terraform-plan.outputs.plan_source }}"
           echo "Used Approved Plan: ${{ needs.terraform-plan.outputs.using_approved_plan }}"
           echo "Plan Hash: ${{ needs.terraform-plan.outputs.plan_hash }}"
           echo "ZIP Hash: ${{ needs.terraform-plan.outputs.zip_hash }}"
           echo "Cache Key: ${{ needs.terraform-plan.outputs.cache_key }}"
+          echo "Matched Cache Key: ${{ needs.terraform-plan.outputs.matched_cache_key }}"
           echo "Commit: ${{ github.sha }}"
           echo "Workflow: ${{ github.run_id }}"
           echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
