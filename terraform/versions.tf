@@ -17,8 +17,11 @@ terraform {
   }
 
   # Backend local para GitHub Artifacts
-  backend "local" {
-    path = "terraform.tfstate"
+  backend "s3" {
+    bucket  = "terraform-state-fperez84-1772045147"
+    key     = "infrastructure/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
   }
 }
 

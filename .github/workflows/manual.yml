@@ -12,15 +12,11 @@ on:
         - plan
         - apply
         - destroy
-      environment:
-        description: 'Environment'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-        - dev
-        - staging
-        - prod
+      use_cached_plan:
+        description: 'Use cached plan for apply (if available)'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -29,29 +25,58 @@ env:
   TF_VERSION: '1.14.3'
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   TF_IN_AUTOMATION: true
+  ENVIRONMENT: 'dev'
 
 jobs:
   terraform-manual:
     name: 'Manual ${{ inputs.action }}'
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    environment: dev
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
-      TF_VAR_environment: ${{ inputs.environment }}
+      TF_VAR_environment: dev
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       
-      - name: Download Previous State
-        if: inputs.action != 'plan'
-        uses: actions/download-artifact@v4
+      - name: Display Operation Info
+        run: |
+          echo "🔧 MANUAL TERRAFORM OPERATION"
+          echo "============================="
+          echo "Action: ${{ inputs.action }}"
+          echo "Environment: dev"
+          echo "Use Cached Plan: ${{ inputs.use_cached_plan }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "============================="
+      
+      # Intentar restaurar plan existente si es apply y se solicita
+      - name: Try Restore Existing Plan
+        if: inputs.action == 'apply' && inputs.use_cached_plan == true
+        id: restore_plan
+        uses: actions/cache/restore@v4
         with:
-          name: terraform-state
-          path: terraform/
-        continue-on-error: true
+          path: |
+            terraform/tfplan
+            terraform/lambda_function.zip
+            plan_metadata.json
+          key: terraform-approved-plan-${{ github.sha }}
+      
+      # Si no encuentra plan del PR, buscar plan de main reciente
+      - name: Try Restore Recent Main Plan
+        if: inputs.action == 'apply' && inputs.use_cached_plan == true && steps.restore_plan.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            terraform/tfplan
+            terraform/lambda_function.zip
+            plan_metadata.json
+          restore-keys: |
+            terraform-apply-
+            terraform-main-plan-
       
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -62,29 +87,135 @@ jobs:
         run: terraform init
         working-directory: ./terraform
       
+      - name: Check Plan Status
+        if: inputs.action == 'apply'
+        run: |
+          if [ "${{ inputs.use_cached_plan }}" == "true" ]; then
+            if [ -f "terraform/tfplan" ]; then
+              echo "✅ Found cached plan to apply"
+              if [ -f "plan_metadata.json" ]; then
+                echo "📋 Plan metadata:"
+                cat plan_metadata.json
+              fi
+            else
+              echo "⚠️ No cached plan found - will generate new plan"
+            fi
+          else
+            echo "🆕 Generating fresh plan as requested"
+          fi
+      
       - name: Terraform ${{ inputs.action }}
         run: |
           case "${{ inputs.action }}" in
             plan)
-              terraform plan -no-color
-              ;;
-            apply)
+              echo "📋 Running plan for environment: dev"
               terraform plan -no-color -out=tfplan
+              
+              # Crear metadata para el plan manual
+
+              CURRENT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              PLAN_HASH=$(sha256sum tfplan | cut -d' ' -f1)
+              ZIP_HASH=$(sha256sum lambda_function.zip | cut -d' ' -f1)
+              CACHE_KEY="terraform-manual-plan-${{ github.run_id }}"
+              
+              cat > plan_metadata.json << EOF
+              {
+                "commit_sha": "${{ github.sha }}",
+                "pr_number": "N/A",
+                "plan_hash": "$PLAN_HASH",
+                "zip_hash": "$ZIP_HASH",
+                "created_at": "$CURRENT_TIMESTAMP",
+                "author": "${{ github.actor }}",
+                "title": "Manual plan generation",
+                "workflow_run_id": "${{ github.run_id }}",
+                "timestamp": "$CURRENT_TIMESTAMP",
+                "source": "manual_workflow",
+                "environment": "dev",
+                "cache_key": "$CACHE_KEY"
+              }
+              EOF
+              
+              echo "📋 Plan generated with metadata:"
+              cat plan_metadata.json
+              ;;
+              
+            apply)
+              echo "🚀 Applying changes for environment: dev"
+              
+              # Si no hay plan cached o no se quiere usar, generar uno nuevo
+              if [ ! -f "tfplan" ] || [ "${{ inputs.use_cached_plan }}" == "false" ]; then
+                echo "🆕 Generating fresh plan..."
+                terraform plan -no-color -out=tfplan
+              fi
+              
+              echo "📋 Showing plan to be applied:"
+              terraform show -no-color tfplan
+              echo ""
+              
               terraform apply -auto-approve tfplan
               ;;
+              
             destroy)
+              echo "💥 Destroying infrastructure for environment: dev"
+              echo "⚠️ This will DELETE all resources!"
               terraform plan -destroy -no-color -out=tfplan
+              
+              echo "📋 Showing destroy plan:"
+              terraform show -no-color tfplan
+              echo ""
+              
               terraform apply -auto-approve tfplan
               ;;
           esac
         working-directory: ./terraform
       
-      - name: Upload State
-        if: inputs.action != 'plan'
-        uses: actions/upload-artifact@v4
+      # Cache plan si es plan o apply que generó nuevo plan
+      - name: Cache Generated Plan
+        if: inputs.action == 'plan' || (inputs.action == 'apply' && (steps.restore_plan.outputs.cache-hit != 'true' || inputs.use_cached_plan == false))
+        uses: actions/cache/save@v4
         with:
-          name: terraform-state
           path: |
-            terraform/terraform.tfstate
+            terraform/tfplan
             terraform/lambda_function.zip
-          retention-days: 30
+            plan_metadata.json
+          key: terraform-manual-plan-${{ github.run_id }}
+      
+      - name: Operation Summary
+        if: always()
+        run: |
+          echo ""
+          echo "📊 MANUAL OPERATION SUMMARY"
+          echo "==========================="
+          echo "Action: ${{ inputs.action }}"
+          echo "Status: ${{ job.status }}"
+          echo "Environment: dev"
+          echo "Use Cached Plan: ${{ inputs.use_cached_plan }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Operation completed successfully"
+            
+            case "${{ inputs.action }}" in
+              plan)
+                echo "📋 Plan generated and cached for future apply"
+                echo "💡 You can now run 'apply' with cached plan"
+                ;;
+              apply)
+                echo "🚀 Infrastructure updated successfully"
+                echo "🗃️ State stored in S3 backend"
+                ;;
+              destroy)
+                echo "💥 Infrastructure destroyed"
+                echo "🗃️ State updated in S3 backend"
+                ;;
+            esac
+          else
+            echo "❌ Operation failed - check logs above"
+          fi
+          
+          echo ""
+          echo "Available actions:"
+          echo "- Re-run this workflow with different options"
+          echo "- Check main deployment workflow"
+          echo "- Verify state in S3 backend"
