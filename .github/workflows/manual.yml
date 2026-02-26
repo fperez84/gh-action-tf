@@ -75,6 +75,7 @@ jobs:
             terraform/tfplan
             terraform/lambda_function.zip
             plan_metadata.json
+          key: terraform-fallback-plan-${{ github.run_id }}
           restore-keys: |
             terraform-apply-
             terraform-main-plan-
