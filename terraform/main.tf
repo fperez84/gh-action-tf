@@ -175,3 +175,7 @@ resource "aws_cloudwatch_dashboard" "lambda_dashboard" {
     ]
   })
 }
+
+resource "aws_s3_bucket_notification" "example" {
+  bucket = aws_s3_bucket.example.id
+}
