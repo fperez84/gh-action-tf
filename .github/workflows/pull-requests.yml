@@ -91,6 +91,7 @@ jobs:
   infracost:
     name: 'Cost Estimation'
     runs-on: ubuntu-latest
+    needs: [terraform-fmt, terraform-validate, security-scan, terraform-lint]
     env:
       TF_ROOT: terraform/
     
