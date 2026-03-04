@@ -88,13 +88,35 @@ jobs:
         run: tflint --format compact
         working-directory: ./terraform
 
+  snyk-security:
+    name: 'Snyk IaC Security'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/iac@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          file: terraform/
+          sarif: true
+          args: --severity-threshold=medium
+
+      - name: Upload result to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
   infracost:
     name: 'Cost Estimation'
     runs-on: ubuntu-latest
-    needs: [terraform-fmt, terraform-validate, security-scan, terraform-lint]
+    needs: [terraform-fmt, terraform-validate, security-scan, terraform-lint, snyk-security]
     env:
       TF_ROOT: terraform/
-    
+
     steps:
       - name: Setup Infracost
         uses: infracost/actions/setup@v3
@@ -132,35 +154,35 @@ jobs:
   terraform-plan:
     name: 'Plan'
     runs-on: ubuntu-latest
-    needs: [terraform-fmt, terraform-validate, security-scan, terraform-lint]
+    needs: [terraform-fmt, terraform-validate, security-scan, terraform-lint, snyk-security]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TF_VAR_vpc_id: ${{ vars.TF_VAR_vpc_id }}
       TF_VAR_environment: dev
-    
+
     outputs:
       plan_cache_key: ${{ steps.plan_info.outputs.cache_key }}
       plan_hash: ${{ steps.plan_info.outputs.plan_hash }}
       zip_hash: ${{ steps.plan_info.outputs.zip_hash }}
-    
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-      
+
       - name: Terraform Init
         run: terraform init
         working-directory: ./terraform
-      
+
       - name: Terraform Plan
         run: terraform plan -no-color -out=tfplan
         working-directory: ./terraform
-      
+
       - name: Generate Plan Information
         id: plan_info
         run: |
