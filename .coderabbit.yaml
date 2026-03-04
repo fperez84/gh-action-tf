@@ -1,0 +1,8 @@
+# .coderabbit.yaml
+language: "en"
+reviews:
+  path_filters:
+    - "terraform/lambda_function.py"
+  auto_review:
+    enabled: true
+    drafts: false
