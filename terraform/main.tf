@@ -178,12 +178,12 @@ resource "aws_cloudwatch_dashboard" "lambda_dashboard" {
 
 # En terraform/main.tf, agregar:
 resource "aws_instance" "example" {
-  ami           = "ami-0c02fb55956c7d316"  # Amazon Linux 2
-  instance_type = "t3.micro"  # $0.0104/hour = ~$7.50/month
-  
+  ami           = "ami-0c02fb55956c7d316" # Amazon Linux 2
+  instance_type = "t3.micro"              # $0.0104/hour = ~$7.50/month
+
   vpc_security_group_ids = [aws_security_group.example.id]
   subnet_id              = data.aws_subnet.default.id
-  
+
   tags = {
     Name = "${var.project_name}-${var.environment}-instance"
   }
